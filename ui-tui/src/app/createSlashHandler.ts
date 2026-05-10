@@ -47,66 +47,78 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
 
     if (catalog?.canon) {
       const needle = `/${parsed.name}`.toLowerCase()
+      const exact = Object.entries(catalog.canon).find(([alias]) => alias.toLowerCase() === needle)?.[1]
 
-      const matches = [
-        ...new Set(
-          Object.entries(catalog.canon)
-            .filter(([alias]) => alias.startsWith(needle))
-            .map(([, canon]) => canon)
-        )
-      ]
+      if (exact) {
+        if (exact.toLowerCase() !== needle) {
+          return handler(`${exact}${argTail}`)
+        }
+      } else {
+        const matches = [
+          ...new Set(
+            Object.entries(catalog.canon)
+              .filter(([alias]) => alias.startsWith(needle))
+              .map(([, canon]) => canon)
+          )
+        ]
 
-      if (matches.length === 1 && matches[0]!.toLowerCase() !== needle) {
-        return handler(`${matches[0]}${argTail}`)
-      }
+        if (matches.length === 1 && matches[0]!.toLowerCase() !== needle) {
+          return handler(`${matches[0]}${argTail}`)
+        }
 
-      if (matches.length > 1) {
-        sys(`ambiguous command: ${matches.slice(0, 6).join(', ')}${matches.length > 6 ? ', …' : ''}`)
+        if (matches.length > 1) {
+          sys(`ambiguous command: ${matches.slice(0, 6).join(', ')}${matches.length > 6 ? ', …' : ''}`)
 
-        return true
+          return true
+        }
       }
     }
 
-    gw.request('command.dispatch', { arg: parsed.arg, name: parsed.name, session_id: sid })
-      .then((raw: unknown) => {
+    gw.request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: sid })
+      .then(r => {
         if (stale()) {
           return
         }
 
-        const d = asCommandDispatch(raw)
+        const body = r?.output || `/${parsed.name}: no output`
+        const text = r?.warning ? `warning: ${r.warning}\n${body}` : body
+        const long = text.length > 180 || text.split('\n').filter(Boolean).length > 2
 
-        if (!d) {
-          return sys('error: invalid response: command.dispatch')
-        }
-
-        if (d.type === 'exec' || d.type === 'plugin') {
-          return sys(d.output || '(no output)')
-        }
-
-        if (d.type === 'alias') {
-          return handler(`/${d.target}${argTail}`)
-        }
-
-        if (d.type === 'skill') {
-          sys(`⚡ loading skill: ${d.name}`)
-
-          return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: skill payload missing message`)
-        }
-
-        return sys(`error: unsupported command.dispatch type: ${String((d as { type?: unknown }).type ?? 'unknown')}`)
+        long ? page(text, parsed.name[0]!.toUpperCase() + parsed.name.slice(1)) : sys(text)
       })
       .catch(() => {
-        gw.request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: sid })
-          .then(r => {
+        gw.request('command.dispatch', { arg: parsed.arg, name: parsed.name, session_id: sid })
+          .then((raw: unknown) => {
             if (stale()) {
               return
             }
 
-            const body = r?.output || `/${parsed.name}: no output`
-            const text = r?.warning ? `warning: ${r.warning}\n${body}` : body
-            const long = text.length > 180 || text.split('\n').filter(Boolean).length > 2
+            const d = asCommandDispatch(raw)
 
-            long ? page(text, parsed.name[0]!.toUpperCase() + parsed.name.slice(1)) : sys(text)
+            if (!d) {
+              return sys('error: invalid response: command.dispatch')
+            }
+
+            if (d.type === 'exec' || d.type === 'plugin') {
+              return sys(d.output || '(no output)')
+            }
+
+            if (d.type === 'alias') {
+              return handler(`/${d.target}${argTail}`)
+            }
+
+            if (d.type === 'skill') {
+              sys(`⚡ loading skill: ${d.name}`)
+
+              return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: skill payload missing message`)
+            }
+
+            if (d.type === 'send') {
+              if (d.notice?.trim()) {
+                sys(d.notice)
+              }
+              return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: empty message`)
+            }
           })
           .catch(guardedErr)
       })
