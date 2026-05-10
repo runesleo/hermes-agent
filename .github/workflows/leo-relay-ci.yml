@@ -1,0 +1,49 @@
+# Scoped CI for Leo fork: validates relay-hardening paths without requiring the
+# full upstream matrix to be green (fork carries gateway/routing deltas).
+name: Leo Relay CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leo-relay-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  relay-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      # Uses repo pyproject addopts (-m "not integration", xdist). Ubuntu has no
+      # macOS Keychain, so anthropic_adapter credential tests stay isolated.
+      - name: Relay-focused pytest
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            tests/agent/test_error_classifier.py \
+            tests/agent/test_anthropic_adapter.py \
+            -q --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""

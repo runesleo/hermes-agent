@@ -65,6 +65,14 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 
+def _message_text_looks_like_slash_command(text: str) -> bool:
+    """True when *text* looks like a slash command (not a Unix-style path)."""
+    if not text or not text.startswith("/"):
+        return False
+    first_word = text.split()[0]
+    return "/" not in first_word[1:]
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -5597,6 +5605,38 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _apply_natural_language_model_switch(self, event: MessageEvent) -> bool:
+        """Rewrite explicit natural-language model switches into ``/model``."""
+        text = (getattr(event, "text", "") or "").strip()
+        if not text or _message_text_looks_like_slash_command(text):
+            return False
+        try:
+            from hermes_cli.model_switch_intent import maybe_build_model_switch_command
+
+            rewritten = maybe_build_model_switch_command(text)
+        except Exception:
+            rewritten = None
+        if not rewritten:
+            return False
+        event.text = rewritten
+        return True
+
+    def _apply_natural_language_task_route(self, event: MessageEvent) -> bool:
+        """Rewrite explicit Claude/Codex routing phrases into slash commands."""
+        text = (getattr(event, "text", "") or "").strip()
+        if not text or _message_text_looks_like_slash_command(text):
+            return False
+        try:
+            from hermes_cli.task_route_intent import maybe_build_task_route_command
+
+            rewritten = maybe_build_task_route_command(text)
+        except Exception:
+            rewritten = None
+        if not rewritten:
+            return False
+        event.text = rewritten
+        return True
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -6185,6 +6225,12 @@ class GatewayRunner:
             else:
                 self._pending_messages[_quick_key] = event.text
             return None
+
+        # Natural-language → slash rewriting before command parsing (CLI parity).
+        if self._apply_natural_language_model_switch(event):
+            source = event.source
+        elif self._apply_natural_language_task_route(event):
+            source = event.source
 
         # Check for commands
         command = event.get_command()

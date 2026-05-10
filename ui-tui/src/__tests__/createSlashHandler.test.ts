@@ -468,10 +468,6 @@ describe('createSlashHandler', () => {
         gw: {
           getLogTail: vi.fn(() => ''),
           request: vi.fn((method: string) => {
-            if (method === 'slash.exec') {
-              return Promise.reject(new Error('no'))
-            }
-
             if (method === 'command.dispatch') {
               return Promise.resolve({ type: 'alias', target: 'help' })
             }
@@ -488,6 +484,36 @@ describe('createSlashHandler', () => {
     await vi.waitFor(() => {
       expect(ctx.transcript.panel).toHaveBeenCalledWith(expect.any(String), expect.any(Array))
     })
+  })
+
+  it('routes skill slash commands through command.dispatch before slash.exec', async () => {
+    const ctx = buildCtx({
+      gateway: {
+        gw: {
+          getLogTail: vi.fn(() => ''),
+          request: vi.fn((method: string) => {
+            if (method === 'command.dispatch') {
+              return Promise.resolve({ type: 'skill', name: 'today', message: 'run /today payload' })
+            }
+
+            if (method === 'slash.exec') {
+              return Promise.resolve({ output: 'should not run' })
+            }
+
+            return Promise.resolve({})
+          })
+        },
+        rpc: vi.fn(() => Promise.resolve({}))
+      }
+    })
+
+    const h = createSlashHandler(ctx)
+    expect(h('/today')).toBe(true)
+    await vi.waitFor(() => {
+      expect(ctx.transcript.send).toHaveBeenCalledWith('run /today payload')
+    })
+    expect(ctx.transcript.sys).toHaveBeenCalledWith('⚡ loading skill: today')
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
 
   it('resolves unique local aliases through the catalog', () => {

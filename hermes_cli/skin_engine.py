@@ -113,6 +113,8 @@ Activate with ``/skin <name>`` in the CLI or ``display.skin: <name>`` in config.
 """
 
 import logging
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -761,19 +763,59 @@ def get_active_skin_name() -> str:
     return _active_skin_name
 
 
+def _system_prefers_dark_mode() -> bool:
+    """Best-effort system dark-mode detection.
+
+    Currently supports macOS via AppleScript. Falls back to False on any error.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'tell application "System Events" to tell appearance preferences to get dark mode',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+        return result.stdout.strip().lower() == "true"
+    except Exception:
+        return False
+
+
+
+def resolve_configured_skin_name(display: Any) -> str:
+    """Resolve the effective skin name from a ``display`` config fragment."""
+    if not isinstance(display, dict):
+        return "default"
+
+    skin_name = display.get("skin", "default")
+    if not isinstance(skin_name, str) or not skin_name.strip():
+        return "default"
+
+    requested_skin = skin_name.strip()
+    if requested_skin in {"auto", "system", "system-auto"}:
+        light_skin = str(display.get("light_skin") or "daylight").strip() or "daylight"
+        dark_skin = str(display.get("dark_skin") or "slate").strip() or "slate"
+        return dark_skin if _system_prefers_dark_mode() else light_skin
+
+    return requested_skin
+
+
+
 def init_skin_from_config(config: dict) -> None:
     """Initialize the active skin from CLI config at startup.
 
     Call this once during CLI init with the loaded config dict.
+    Supports ``display.skin: auto`` to choose between ``display.light_skin``
+    and ``display.dark_skin`` based on the current system appearance.
     """
     display = config.get("display") or {}
-    if not isinstance(display, dict):
-        display = {}
-    skin_name = display.get("skin", "default")
-    if isinstance(skin_name, str) and skin_name.strip():
-        set_active_skin(skin_name.strip())
-    else:
-        set_active_skin("default")
+    set_active_skin(resolve_configured_skin_name(display))
 
 
 # =============================================================================

@@ -688,7 +688,7 @@ class TestInit:
             assert a._use_prompt_caching is False
 
     def test_prompt_caching_non_openrouter(self):
-        """Custom base_url (not OpenRouter) should disable prompt caching."""
+        """Custom base_url (not OpenRouter) should disable prompt caching by default."""
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -703,6 +703,51 @@ class TestInit:
                 skip_memory=True,
             )
             assert a._use_prompt_caching is False
+
+    def test_prompt_caching_custom_claude_allowlisted_by_env(self, monkeypatch):
+        """Allowlisted Anthropic-compatible relays should use prompt caching for Claude."""
+        monkeypatch.setenv("HERMES_PROMPT_CACHING_CUSTOM_CLAUDE_URLS", "relay.leolabs.me")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                provider="custom",
+                model="claude-opus-4-7",
+                base_url="https://relay.leolabs.me/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._use_prompt_caching is True
+            assert a._cache_ttl == "5m"
+
+    def test_prompt_caching_custom_claude_allowlisted_by_config(self):
+        """Config allowlist should enable prompt caching for trusted Claude relays."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config", return_value={
+                "prompt_caching": {
+                    "custom_claude_urls": ["relay.leolabs.me"],
+                    "ttl": "1h",
+                }
+            }),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                provider="custom",
+                model="claude-opus-4-7",
+                base_url="https://relay.leolabs.me/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert a._use_prompt_caching is True
+            assert a._cache_ttl == "1h"
 
     def test_prompt_caching_native_anthropic(self):
         """Native Anthropic provider should enable prompt caching."""

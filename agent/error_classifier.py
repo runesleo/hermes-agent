@@ -254,6 +254,29 @@ _THINKING_SIG_PATTERNS = [
     "signature",  # Combined with "thinking" check
 ]
 
+# Tool round-trip / messages payload corruption (relays often surface these as HTTP 500).
+# Retrying the same conversation state burns quota and backoff time (#leo-relay / T260).
+_TOOL_PAYLOAD_CORRUPTION_MARKERS = (
+    "unexpected tool_use_id",
+    "unexpected tool_use_ids",
+    "tool_use_id found in tool_result",
+    "tool_use_ids found in tool_result",
+)
+
+
+def _tool_roundtrip_payload_error(error_msg: str) -> bool:
+    """True when the failure is a structural tools payload issue, not transient server noise."""
+    if not error_msg:
+        return False
+    em = error_msg.lower()
+    if any(marker in em for marker in _TOOL_PAYLOAD_CORRUPTION_MARKERS):
+        return True
+    if "invalid_request_error" in em and (
+        "tool_use" in em or "tool_result" in em or "tool_use_id" in em
+    ):
+        return True
+    return False
+
 # Message-string patterns that indicate a provider-side timeout even when
 # the exception type is generic (e.g. RuntimeError from a local shim that
 # wraps a subprocess timeout).  Checked before the type-based transport
@@ -436,6 +459,14 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # ── 0. Tool payload corruption (any HTTP status, including relay 500s) ──
+    if _tool_roundtrip_payload_error(error_msg):
+        return _result(
+            FailoverReason.format_error,
+            retryable=False,
+            should_fallback=True,
+        )
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 

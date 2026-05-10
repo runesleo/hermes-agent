@@ -1411,6 +1411,7 @@ quick_commands:
   status:
     type: exec
     command: systemctl status hermes-agent
+    timeout: 120
   disk:
     type: exec
     command: df -h /
@@ -1427,7 +1428,7 @@ quick_commands:
 
 Usage: type `/status`, `/disk`, `/update`, `/gpu`, or `/restart` in the CLI or any messaging platform. `exec` commands run locally on the host and return the output directly — no LLM call, no tokens consumed. `alias` commands rewrite to the configured slash command target.
 
-- **30-second timeout** — long-running commands are killed with an error message
+- **Optional `timeout` field** — defaults to 30 seconds; set a longer timeout for workflows that intentionally run longer
 - **Priority** — quick commands are checked before skill commands, so you can override skill names
 - **Autocomplete** — quick commands are resolved at dispatch time and are not shown in the built-in slash-command autocomplete tables
 - **Type** — supported types are `exec` and `alias`; other types show an error

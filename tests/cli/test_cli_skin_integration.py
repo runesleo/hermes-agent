@@ -106,6 +106,42 @@ class TestCliSkinPromptIntegration:
         assert "Prompt + TUI colors updated." in output
         assert cli._app.style is not None
 
+    def test_refresh_auto_skin_if_needed_updates_running_app(self):
+        cli = _make_cli_stub()
+        cli.config = {
+            "display": {
+                "skin": "auto",
+                "light_skin": "daylight",
+                "dark_skin": "slate",
+            }
+        }
+
+        set_active_skin("daylight")
+        with patch("hermes_cli.skin_engine._system_prefers_dark_mode", return_value=True):
+            assert cli._refresh_auto_skin_if_needed() is True
+
+        assert get_active_skin().name == "slate"
+        assert cli._app.style is not None
+
+    def test_invalidate_auto_skin_refreshes_before_repaint(self):
+        cli = _make_cli_stub()
+        cli.config = {
+            "display": {
+                "skin": "auto",
+                "light_skin": "daylight",
+                "dark_skin": "slate",
+            }
+        }
+        cli._last_invalidate = 0.0
+        cli._app.invalidate = MagicMock()
+
+        set_active_skin("daylight")
+        with patch("hermes_cli.skin_engine._system_prefers_dark_mode", return_value=True):
+            HermesCLI._invalidate(cli, min_interval=0.0)
+
+        assert get_active_skin().name == "slate"
+        cli._app.invalidate.assert_called_once()
+
 
 class TestAnsiRichTextHelper:
     def test_preserves_literal_brackets(self):
@@ -115,3 +151,14 @@ class TestAnsiRichTextHelper:
     def test_strips_ansi_but_keeps_plain_text(self):
         text = _rich_text_from_ansi("\x1b[31mred\x1b[0m")
         assert text.plain == "red"
+
+    def test_plain_text_inherits_default_style_when_requested(self):
+        text = _rich_text_from_ansi("plain body", default_style="#e5e7eb")
+        assert text.plain == "plain body"
+        assert text.style == "#e5e7eb"
+
+    def test_existing_ansi_spans_are_preserved_over_default_style(self):
+        text = _rich_text_from_ansi("\x1b[31mred\x1b[0m", default_style="#e5e7eb")
+        assert text.plain == "red"
+        assert text.style == "#e5e7eb"
+        assert text.spans

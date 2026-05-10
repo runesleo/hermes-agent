@@ -1448,6 +1448,74 @@ def _content_parts_to_anthropic_blocks(parts: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _sanitize_tool_turn_adjacency(result: List[Dict[str, Any]]) -> None:
+    """Remove tool_result blocks that do not belong to the *immediately prior*
+    assistant tool-use turn.
+
+    Global orphan stripping (later in this function) only checks whether a
+    tool_use_id exists *somewhere* among assistant messages.  That misses
+    duplicates and stale results where a newer assistant message (no tools)
+    sits between the original tool_use and a stray tool_result — a pattern
+    observed when relays return HTTP 500 for ``unexpected tool_use_id`` (#T260).
+    """
+    pending_ids: Optional[frozenset[str]] = None
+
+    for msg in result:
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if role == "assistant":
+            ids: set[str] = set()
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tid = block.get("id")
+                        if tid:
+                            ids.add(str(tid))
+            pending_ids = frozenset(ids) if ids else frozenset()
+            continue
+
+        if role != "user":
+            continue
+
+        allowed: frozenset[str] = pending_ids if pending_ids is not None else frozenset()
+        pending_ids = None
+
+        if not isinstance(content, list):
+            continue
+
+        kept: List[Any] = []
+        seen_result_ids: set[str] = set()
+        removed = 0
+        for block in content:
+            if not isinstance(block, dict):
+                kept.append(block)
+                continue
+            if block.get("type") != "tool_result":
+                kept.append(block)
+                continue
+            tid_raw = block.get("tool_use_id")
+            tid = str(tid_raw) if tid_raw is not None else ""
+            if not allowed or tid not in allowed or tid in seen_result_ids:
+                removed += 1
+                continue
+            seen_result_ids.add(tid)
+            kept.append(block)
+
+        if removed:
+            logger.warning(
+                "Anthropic adapter: stripped %d misplaced/duplicate tool_result block(s) "
+                "(adjacency guard; allowed_ids=%s)",
+                removed,
+                sorted(allowed) if allowed else [],
+            )
+
+        if not kept:
+            msg["content"] = [{"type": "text", "text": "(tool result removed)"}]
+        elif len(kept) != len(content):
+            msg["content"] = kept
+
+
 def convert_messages_to_anthropic(
     messages: List[Dict],
     base_url: str | None = None,
@@ -1623,6 +1691,9 @@ def convert_messages_to_anthropic(
             if not content or (isinstance(content, str) and not content.strip()):
                 content = "(empty message)"
             result.append({"role": "user", "content": content})
+
+    # Adjacent-turn guard — must run before global orphan passes (#T260 / relay 500s).
+    _sanitize_tool_turn_adjacency(result)
 
     # Strip orphaned tool_use blocks (no matching tool_result follows)
     tool_result_ids = set()
