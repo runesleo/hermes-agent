@@ -228,7 +228,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         for scan_dir in dirs_to_scan:
             for skill_md in scan_dir.rglob("SKILL.md"):
-                if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
+                if any(part in ('.git', '.github', '.hub', '_archived') for part in skill_md.parts):
                     continue
                 try:
                     content = skill_md.read_text(encoding='utf-8')

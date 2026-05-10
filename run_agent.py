@@ -877,14 +877,37 @@ class AIAgent:
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         self._force_ascii_payload = False
         
-        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
+        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter
+        # and native Anthropic. Trusted custom Claude relays can opt in via
+        # config/env because otherwise long Hermes sessions resend the full
+        # system/tools/memory prefix as uncached input every turn.
         is_openrouter = self._is_openrouter_url()
         is_claude = "claude" in self.model.lower()
         is_native_anthropic = self.api_mode == "anthropic_messages" and self.provider == "anthropic"
-        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
-        self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
+        _prompt_cache_cfg: Dict[str, Any] = {}
+        try:
+            from hermes_cli.config import load_config as _load_prompt_cache_config
+            _loaded_cfg = _load_prompt_cache_config() or {}
+            if isinstance(_loaded_cfg.get("prompt_caching"), dict):
+                _prompt_cache_cfg = _loaded_cfg.get("prompt_caching") or {}
+        except Exception:
+            _prompt_cache_cfg = {}
+        is_custom_claude_cache_allowed = self._custom_claude_prompt_caching_allowed(_prompt_cache_cfg)
+        self._use_prompt_caching = (
+            (is_openrouter and is_claude)
+            or is_native_anthropic
+            or (is_claude and is_custom_claude_cache_allowed)
+        )
+        _ttl = str(os.getenv("HERMES_PROMPT_CACHING_TTL") or _prompt_cache_cfg.get("ttl") or "5m").strip()
+        self._cache_ttl = "1h" if _ttl == "1h" else "5m"  # 5m write cost 1.25x; 1h write cost 2x
+        if is_native_anthropic:
+            self._prompt_caching_source = "native Anthropic"
+        elif is_openrouter and is_claude:
+            self._prompt_caching_source = "Claude via OpenRouter"
+        elif is_claude and is_custom_claude_cache_allowed:
+            self._prompt_caching_source = "Claude via custom relay"
+        else:
+            self._prompt_caching_source = ""
         
         # Iteration budget: the LLM is only notified when it actually exhausts
         # the iteration budget (api_call_count >= max_iterations).  At that
@@ -1145,6 +1168,9 @@ class AIAgent:
         
         # Provider fallback chain — ordered list of backup providers tried
         # when the primary is exhausted (rate-limit, overload, connection
+        self._primary_model = self.model
+        self._primary_provider = self.provider
+
         # failure).  Supports both legacy single-dict ``fallback_model`` and
         # new list ``fallback_providers`` format.
         if isinstance(fallback_model, list):
@@ -1161,12 +1187,15 @@ class AIAgent:
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
+            primary_route = f"{self._primary_provider or 'unknown'}:{self._primary_model or 'unknown'}"
             if len(self._fallback_chain) == 1:
                 fb = self._fallback_chain[0]
-                print(f"🔄 Fallback model: {fb['model']} ({fb['provider']})")
+                print(f"🔄 Route fallback: {primary_route} → {fb['provider']}:{fb['model']}")
             else:
-                print(f"🔄 Fallback chain ({len(self._fallback_chain)} providers): " +
-                      " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
+                print(
+                    f"🔄 Route fallback chain from {primary_route}: " +
+                    " → ".join(f"{f['provider']}:{f['model']}" for f in self._fallback_chain)
+                )
 
         # Get available tools with filtering
         self.tools = get_tool_definitions(
@@ -1209,7 +1238,7 @@ class AIAgent:
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
-            source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
+            source = self._prompt_caching_source or "Claude"
             print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
         
         # Session logging setup - auto-save conversation trajectories for debugging
@@ -1824,9 +1853,11 @@ class AIAgent:
 
         # ── Re-evaluate prompt caching ──
         is_native_anthropic = api_mode == "anthropic_messages" and new_provider == "anthropic"
+        is_custom_claude_cache_allowed = self._custom_claude_prompt_caching_allowed()
         self._use_prompt_caching = (
             ("openrouter" in (self.base_url or "").lower() and "claude" in new_model.lower())
             or is_native_anthropic
+            or ("claude" in new_model.lower() and is_custom_claude_cache_allowed)
         )
 
         # ── Update context compressor ──
@@ -2113,6 +2144,70 @@ class AIAgent:
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
+
+    def _custom_claude_prompt_caching_allowed(self, prompt_cache_cfg: Optional[Dict[str, Any]] = None) -> bool:
+        """Return True when this custom Claude relay is explicitly trusted for cache_control.
+
+        Some OpenAI-compatible relays forward Anthropic `cache_control` blocks to
+        Claude. Enabling that blindly can break local/non-Anthropic endpoints, so
+        custom relays must be allowlisted by config or environment.
+        """
+        if self.provider not in {"custom", ""}:
+            return False
+        if not self.base_url:
+            return False
+        if isinstance(prompt_cache_cfg, dict):
+            cfg = prompt_cache_cfg
+        else:
+            try:
+                from hermes_cli.config import load_config as _load_prompt_cache_config
+                _loaded_cfg = _load_prompt_cache_config() or {}
+                cfg = _loaded_cfg.get("prompt_caching") or {}
+                if not isinstance(cfg, dict):
+                    cfg = {}
+            except Exception:
+                cfg = {}
+        enabled_raw = os.getenv("HERMES_PROMPT_CACHING_ENABLED")
+        if enabled_raw is not None and enabled_raw.strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        if cfg.get("enabled") is False:
+            return False
+
+        allow_items: List[str] = []
+        env_allow = os.getenv("HERMES_PROMPT_CACHING_CUSTOM_CLAUDE_URLS", "")
+        if env_allow.strip():
+            allow_items.extend([x.strip() for x in env_allow.split(",") if x.strip()])
+        cfg_allow = cfg.get("custom_claude_urls") or cfg.get("custom_claude_relays") or []
+        if isinstance(cfg_allow, str):
+            allow_items.extend([x.strip() for x in cfg_allow.split(",") if x.strip()])
+        elif isinstance(cfg_allow, (list, tuple, set)):
+            allow_items.extend([str(x).strip() for x in cfg_allow if str(x).strip()])
+        if not allow_items:
+            return False
+
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(self.base_url if "://" in self.base_url else f"https://{self.base_url}")
+            base_host = (parsed.hostname or "").lower()
+            base_url = self.base_url.strip().lower().rstrip("/")
+        except Exception:
+            base_host = ""
+            base_url = self.base_url.strip().lower().rstrip("/")
+
+        for item in allow_items:
+            pattern = item.lower().rstrip("/")
+            if not pattern:
+                continue
+            if pattern == "*":
+                return True
+            if "://" in pattern:
+                if base_url.startswith(pattern):
+                    return True
+                continue
+            host_pattern = pattern.split("/", 1)[0]
+            if base_host == host_pattern or base_host.endswith(f".{host_pattern}"):
+                return True
+        return False
 
     @staticmethod
     def _model_requires_responses_api(model: str) -> bool:
@@ -5769,6 +5864,14 @@ class AIAgent:
             # response via .response before any chunks are consumed.
             self._capture_rate_limits(getattr(stream, "response", None))
 
+            # Some adapters behind the chat_completions surface accept
+            # ``stream=True`` but still return a concrete response object
+            # instead of an iterator. Copilot ACP currently does this. Treat
+            # that shape as a completed non-streaming response rather than
+            # iterating into a TypeError on ``SimpleNamespace``-style objects.
+            if not hasattr(stream, "__iter__"):
+                return stream
+
             content_parts: list = []
             tool_calls_acc: dict = {}
             tool_gen_notified: set = set()
@@ -6386,6 +6489,7 @@ class AIAgent:
                 fb_api_mode = "bedrock_converse"
 
             old_model = self.model
+            old_provider = self.provider
             self.model = fb_model
             self.provider = fb_provider
             self.base_url = fb_base_url
@@ -6426,9 +6530,11 @@ class AIAgent:
 
             # Re-evaluate prompt caching for the new provider/model
             is_native_anthropic = fb_api_mode == "anthropic_messages" and fb_provider == "anthropic"
+            is_custom_claude_cache_allowed = self._custom_claude_prompt_caching_allowed()
             self._use_prompt_caching = (
                 ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
                 or is_native_anthropic
+                or ("claude" in fb_model.lower() and is_custom_claude_cache_allowed)
             )
 
             # Update context compressor limits for the fallback model.
@@ -6450,8 +6556,8 @@ class AIAgent:
                 )
 
             self._emit_status(
-                f"🔄 Primary model failed — switching to fallback: "
-                f"{fb_model} via {fb_provider}"
+                f"🔄 Route switch: {old_provider or 'unknown'}:{old_model or 'unknown'} "
+                f"→ {fb_provider}:{fb_model}"
             )
             logging.info(
                 "Fallback activated: %s → %s (%s)",
@@ -9223,7 +9329,7 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            max_retries = 5
             primary_recovery_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted=False
@@ -9521,7 +9627,10 @@ class AIAgent:
                         
                         if retry_count >= max_retries:
                             # Try fallback before giving up
-                            self._emit_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
+                            self._emit_status(
+                                f"⚠️ Max retries ({max_retries}) for invalid responses on "
+                                f"{self.provider or 'unknown'}:{self.model or 'unknown'} — trying fallback..."
+                            )
                             if self._try_activate_fallback():
                                 retry_count = 0
                                 compression_attempts = 0
@@ -10659,7 +10768,10 @@ class AIAgent:
                             retry_count = 0
                             continue
                         # Try fallback before giving up entirely
-                        self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                        self._emit_status(
+                            f"⚠️ Max retries ({max_retries}) exhausted on "
+                            f"{self.provider or 'unknown'}:{self.model or 'unknown'} — trying fallback..."
+                        )
                         if self._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
@@ -10711,7 +10823,10 @@ class AIAgent:
                                 api_kwargs, reason="max_retries_exhausted", error=api_error,
                             )
                         self._persist_session(messages, conversation_history)
-                        _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
+                        _final_response = (
+                            f"API call failed after {max_retries} retries "
+                            f"on {self.provider or 'unknown'}:{self.model or 'unknown'}: {_final_summary}"
+                        )
                         if _is_stream_drop:
                             _final_response += (
                                 "\n\nThe provider's stream connection keeps "

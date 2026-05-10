@@ -116,6 +116,321 @@ def _assistant_copy_text(content: Any) -> str:
     return _strip_reasoning_tags(_assistant_content_as_text(content))
 
 
+def _fmt_minutes_compact(total_minutes: int | float | None) -> str:
+    if total_minutes is None:
+        return ""
+    try:
+        total = max(0, int(float(total_minutes)))
+    except (TypeError, ValueError):
+        return ""
+    hours, mins = divmod(total, 60)
+    if hours > 0:
+        return f"~{hours}h{mins}m"
+    return f"~{mins}m"
+
+
+def _fmt_compact_number(value: int | float | None) -> str:
+    if value is None:
+        return "0"
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _read_json_file(path: Path) -> dict | list | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _find_active_claude_block() -> dict | None:
+    cache_path = Path.home() / ".claude" / "ccusage-cache.json"
+    data = _read_json_file(cache_path)
+    if not isinstance(data, dict):
+        return None
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        return None
+    active = [b for b in blocks if isinstance(b, dict) and b.get("isActive")]
+    block = active[-1] if active else blocks[-1]
+    return block if isinstance(block, dict) else None
+
+
+def _format_quota_reset_countdown(value: Any) -> str:
+    """Format a quota-reset hint as a short countdown like '3d4h' or '12h'.
+
+    Accepts either an ISO-8601 string (e.g. '2026-05-14T21:00:00Z') used by the
+    Claude HUD cache, or a Unix epoch second integer used by the Codex
+    rate_limits payload. Returns '' if the value is missing/invalid or already
+    in the past.
+    """
+    if value is None or value == "":
+        return ""
+    target_ts: float | None = None
+    try:
+        if isinstance(value, (int, float)):
+            target_ts = float(value)
+        else:
+            text = str(value).strip()
+            if not text:
+                return ""
+            if text.isdigit():
+                target_ts = float(text)
+            else:
+                # ISO-8601, normalize trailing Z
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                from datetime import datetime as _dt
+                target_ts = _dt.fromisoformat(text).timestamp()
+    except Exception:
+        return ""
+    if target_ts is None:
+        return ""
+    delta = target_ts - time.time()
+    if delta <= 0:
+        return ""
+    minutes = int(delta // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        rem_min = minutes - hours * 60
+        return f"{hours}h{rem_min}m" if rem_min and hours < 6 else f"{hours}h"
+    days = hours // 24
+    rem_hours = hours - days * 24
+    return f"{days}d{rem_hours}h" if rem_hours else f"{days}d"
+
+
+def _get_claude_quota_summary() -> str:
+    """Return Claude weekly quota summary from Claude HUD's usage cache/API.
+
+    Claude Code exposes accurate subscriber usage via the statusline stdin
+    `rate_limits` fields. Leo's local Claude HUD plugin can also fetch/cache the
+    same values in `~/.claude/plugins/claude-hud/.usage-cache.json`. Use that as
+    the primary source; if it's missing/stale, ask the plugin's usage-api to
+    refresh it. This gives Codex-like `5h / 7d` semantics rather than the stale
+    per-block projection found in `ccusage-cache.json`.
+    """
+    cache_path = Path.home() / ".claude" / "plugins" / "claude-hud" / ".usage-cache.json"
+
+    def _read_cache() -> dict | None:
+        data = _read_json_file(cache_path)
+        if not isinstance(data, dict):
+            return None
+        payload = data.get("data") if isinstance(data.get("data"), dict) else None
+        return payload if isinstance(payload, dict) else None
+
+    payload = _read_cache()
+    try:
+        stale = (not payload) or (cache_path.exists() and (time.time() - cache_path.stat().st_mtime) > 600)
+    except Exception:
+        stale = not payload
+
+    if stale:
+        try:
+            import subprocess
+            js = (
+                "const mod = await import(`file://${process.env.HOME}/.claude/plugins/marketplaces/claude-hud/dist/usage-api.js`);"
+                "const usage = await mod.getUsage();"
+                "console.log(JSON.stringify(usage||null));"
+            )
+            result = subprocess.run(
+                ["node", "--input-type=module", "-e", js],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                refreshed = json.loads((result.stdout or "null").strip() or "null")
+                if isinstance(refreshed, dict):
+                    payload = refreshed
+        except Exception:
+            pass
+
+    if not isinstance(payload, dict):
+        return ""
+
+    five = payload.get("fiveHour")
+    seven = payload.get("sevenDay")
+    plan = str(payload.get("planName") or "Claude").strip()
+    seven_reset = payload.get("sevenDayResetAt") or ""
+    parts: list[str] = []
+    if plan:
+        parts.append(plan)
+    # HUD cache stores `fiveHour`/`sevenDay` as USED percentage. Convert to
+    # remaining% so the status bar reads "what I have left", matching Codex's
+    # remaining-semantics segment.
+    if isinstance(five, (int, float)):
+        five_left = max(0, min(100, 100 - int(round(float(five)))))
+        parts.append(f"5h {five_left}%")
+    if isinstance(seven, (int, float)):
+        seven_left = max(0, min(100, 100 - int(round(float(seven)))))
+        seg = f"7d {seven_left}%"
+        countdown = _format_quota_reset_countdown(seven_reset)
+        if countdown:
+            seg += f" ({countdown})"
+        parts.append(seg)
+    return " · ".join(parts)
+
+
+def _find_latest_codex_rate_limits() -> dict | None:
+    sessions_root = Path.home() / ".codex" / "sessions"
+    if not sessions_root.exists():
+        return None
+    try:
+        jsonls = sorted(sessions_root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    except Exception:
+        return None
+    for path in reversed(jsonls[-50:]):
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in reversed(handle.readlines()[-200:]):
+                    if "rate_limits" not in line:
+                        continue
+                    try:
+                        payload = json.loads(line).get("payload", {})
+                    except Exception:
+                        continue
+                    rate_limits = payload.get("rate_limits")
+                    if isinstance(rate_limits, dict):
+                        return rate_limits
+        except Exception:
+            continue
+    return None
+
+
+def _get_codex_quota_summary() -> str:
+    rate_limits = _find_latest_codex_rate_limits()
+    if not isinstance(rate_limits, dict):
+        return ""
+    primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else {}
+    secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else {}
+    try:
+        p_remaining = max(0.0, 100.0 - float(primary.get("used_percent") or 0.0))
+    except (TypeError, ValueError):
+        p_remaining = 0.0
+    try:
+        s_remaining = max(0.0, 100.0 - float(secondary.get("used_percent") or 0.0))
+    except (TypeError, ValueError):
+        s_remaining = 0.0
+    plan_type = rate_limits.get("plan_type") or "?"
+    seven_seg = f"7d {s_remaining:.0f}%"
+    countdown = _format_quota_reset_countdown(secondary.get("resets_at"))
+    if countdown:
+        seven_seg += f" ({countdown})"
+    return f"{plan_type} · 5h {p_remaining:.0f}% · {seven_seg}"
+
+
+def _get_copilot_quota_summary() -> str:
+    log_path = Path.home() / ".openclaw" / "logs" / "gateway.log"
+    if not log_path.exists():
+        return ""
+    month_prefix = datetime.now().strftime("%Y-%m")
+    counts = {"sonnet": 0, "opus": 0, "gpt": 0, "other": 0}
+    patterns = {
+        "sonnet": "agent model: github-copilot/claude-sonnet-4.6",
+        "opus": ("agent model: github-copilot/claude-opus-4.5", "agent model: github-copilot/claude-opus-4.6"),
+        "gpt": ("agent model: github-copilot/gpt-5", "agent model: github-copilot/gpt-4.1"),
+        "other": ("agent model: github-copilot/gemini", "agent model: github-copilot/grok", "agent model: github-copilot/minimax"),
+    }
+    try:
+        with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if not line.startswith(month_prefix):
+                    continue
+                for key, needles in patterns.items():
+                    if isinstance(needles, str):
+                        if needles in line:
+                            counts[key] += 1
+                    elif any(needle in line for needle in needles):
+                        counts[key] += 1
+    except Exception:
+        return ""
+    premium_used = counts["sonnet"] + counts["gpt"] + counts["other"] + counts["opus"] * 10
+    return f"est {premium_used}/300 premium"
+
+
+def _get_local_quota_summary(agent: Any) -> str:
+    provider = (getattr(agent, "provider", "") or "").lower()
+    model = (getattr(agent, "model", "") or "").lower()
+    base_url = (getattr(agent, "base_url", "") or "").lower()
+    api_mode = (getattr(agent, "api_mode", "") or "").lower()
+    if provider == "copilot" or "github-copilot" in model or "githubcopilot" in base_url:
+        return _get_copilot_quota_summary()
+    if provider == "openai-codex" or "codex" in model or "backend-api/codex" in base_url or api_mode == "codex_responses":
+        return _get_codex_quota_summary()
+    if "claude" in model or provider == "anthropic" or "anthropic.com" in base_url:
+        return _get_claude_quota_summary()
+    return ""
+
+
+def _compact_quota_summary(summary: str) -> str:
+    text = str(summary or "").strip()
+    if not text:
+        return ""
+
+    # New format with optional `(Xd Yh)` reset countdown on the 7d segment.
+    # The leading-down arrow signals "remaining" semantics so the user can tell
+    # at a glance whether 48 means "48% used" or "48% left".
+    codex = re.match(
+        r"^(?P<plan>[^·]+) · 5h (?P<p1>\d+)% · 7d (?P<p2>\d+)%(?: \((?P<r>[^)]+)\))?$",
+        text,
+    )
+    if codex:
+        out = f"5h {codex.group('p1')}% left · 7d {codex.group('p2')}% left"
+        if codex.group("r"):
+            out += f" ({codex.group('r')})"
+        return out
+
+    claude = re.match(
+        r"^(?P<plan>[^·]+) · 5h (?P<p5>\d+)% · 7d (?P<p7>\d+)%(?: \((?P<r>[^)]+)\))?$",
+        text,
+    )
+    if claude:
+        out = f"5h {claude.group('p5')}% left · 7d {claude.group('p7')}% left"
+        if claude.group("r"):
+            out += f" ({claude.group('r')})"
+        return out
+
+    legacy_claude = re.match(r"^(?P<tok>[^·]+ tok) · (?P<time>~?\d+h\d+m left|~?\d+m left)(?: · (?P<cost>\$[\d.]+))?$", text)
+    if legacy_claude:
+        return legacy_claude.group('time').replace(' left', '')
+
+    copilot = re.match(r"^est (?P<used>\d+/\d+) premium$", text)
+    if copilot:
+        return copilot.group('used')
+
+    return text
+
+
+def _get_global_quota_segments() -> list[tuple[str, str]]:
+    segments: list[tuple[str, str]] = []
+    for label, raw in (
+        ("C", _get_claude_quota_summary()),
+        ("X", _get_codex_quota_summary()),
+        ("P", _get_copilot_quota_summary()),
+    ):
+        compact = _compact_quota_summary(raw)
+        if compact:
+            compact = compact.replace(" · ", "/")
+            segments.append((label, compact))
+    return segments
+
+
+def _format_global_quota_summary(max_segments: int | None = None) -> str:
+    segments = _get_global_quota_segments()
+    if max_segments is not None:
+        segments = segments[:max_segments]
+    return " · ".join(f"{label} {value}" for label, value in segments)
+
+
 # =============================================================================
 # Configuration Loading
 # =============================================================================
@@ -1104,13 +1419,20 @@ def _accent_hex() -> str:
         return "#FFBF00"
 
 
-def _rich_text_from_ansi(text: str) -> _RichText:
+def _rich_text_from_ansi(text: str, default_style: str | None = None) -> _RichText:
     """Safely render assistant/tool output that may contain ANSI escapes.
 
     Using Rich Text.from_ansi preserves literal bracketed text like
     ``[not markup]`` while still interpreting real ANSI color codes.
+
+    ``default_style`` is applied as the base text color so plain responses stay
+    readable inside themed panels, while any explicit ANSI spans still override
+    that base style where present.
     """
-    return _RichText.from_ansi(text or "")
+    rich_text = _RichText.from_ansi(text or "")
+    if default_style:
+        rich_text.style = default_style
+    return rich_text
 
 
 def _cprint(text: str):
@@ -1521,6 +1843,24 @@ def _looks_like_slash_command(text: str) -> bool:
     return "/" not in first_word[1:]
 
 
+def _rewrite_natural_language_model_switch(text: str) -> str | None:
+    """Return a synthesized ``/model`` command for explicit switch requests."""
+    try:
+        from hermes_cli.model_switch_intent import maybe_build_model_switch_command
+        return maybe_build_model_switch_command(text)
+    except Exception:
+        return None
+
+
+def _rewrite_natural_language_task_route(text: str) -> str | None:
+    """Return a synthesized routing command for explicit Claude/Codex delegation."""
+    try:
+        from hermes_cli.task_route_intent import maybe_build_task_route_command
+        return maybe_build_task_route_command(text)
+    except Exception:
+        return None
+
+
 # ============================================================================
 # Skill Slash Commands — dynamic commands generated from installed skills
 # ============================================================================
@@ -1858,6 +2198,8 @@ class HermesCLI:
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
         self._last_invalidate: float = 0.0  # throttle UI repaints
+        self._last_auto_skin_check: float = 0.0
+        self._last_resolved_auto_skin: Optional[str] = None
         self._app = None
 
         # State shared by interactive run() and single-query chat mode.
@@ -1909,9 +2251,52 @@ class HermesCLI:
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
 
+    def _refresh_auto_skin_if_needed(self, *, force: bool = False) -> bool:
+        """Resolve and apply auto skin changes for a running CLI session."""
+        import time as _time
+
+        display_cfg = (getattr(self, "config", {}) or {}).get("display")
+        if not isinstance(display_cfg, dict):
+            return False
+
+        requested = display_cfg.get("skin")
+        if not isinstance(requested, str) or requested.strip() not in {"auto", "system", "system-auto"}:
+            return False
+
+        now = _time.monotonic()
+        if not force and (now - getattr(self, "_last_auto_skin_check", 0.0)) < 0.5:
+            return False
+        self._last_auto_skin_check = now
+
+        try:
+            from hermes_cli.skin_engine import (
+                get_active_skin_name,
+                resolve_configured_skin_name,
+                set_active_skin,
+            )
+
+            resolved_skin = resolve_configured_skin_name(display_cfg)
+            current_skin = get_active_skin_name()
+            last_resolved = getattr(self, "_last_resolved_auto_skin", None)
+            self._last_resolved_auto_skin = resolved_skin
+            if not force and resolved_skin == current_skin and resolved_skin == last_resolved:
+                return False
+            if resolved_skin == current_skin:
+                return False
+
+            set_active_skin(resolved_skin)
+            _ACCENT.reset()
+            _DIM.reset()
+            if getattr(self, "_app", None) and getattr(self, "_tui_style_base", None):
+                self._app.style = PTStyle.from_dict(self._build_tui_style_dict())
+            return True
+        except Exception:
+            return False
+
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
         import time as _time
+        self._refresh_auto_skin_if_needed()
         now = _time.monotonic()
         if hasattr(self, "_app") and self._app and (now - self._last_invalidate) >= min_interval:
             self._last_invalidate = now
@@ -1927,6 +2312,26 @@ class HermesCLI:
         if percent_used >= 50:
             return "class:status-bar-warn"
         return "class:status-bar-good"
+
+    def _status_bar_quota_style(self, quota_text: str) -> str:
+        """Pick a severity style for the quota segment based on 7d remaining%.
+
+        The quota label uses explicit remaining semantics such as
+        ``7d 59% left``. When that number drops we elevate the segment from
+        'dim' to 'warn' / 'critical' so the user spots the squeeze before reset.
+        """
+        try:
+            m = re.search(r"7d\s+(\d+)%\s+left", str(quota_text or ""))
+            if not m:
+                return "class:status-bar-dim"
+            remaining = int(m.group(1))
+            if remaining < 10:
+                return "class:status-bar-critical"
+            if remaining < 20:
+                return "class:status-bar-warn"
+            return "class:status-bar-dim"
+        except Exception:
+            return "class:status-bar-dim"
 
     def _build_context_bar(self, percent_used: Optional[int], width: int = 10) -> str:
         safe_percent = max(0, min(100, percent_used or 0))
@@ -1954,6 +2359,9 @@ class HermesCLI:
             "context_tokens": 0,
             "context_length": None,
             "context_percent": None,
+            "quota_summary": "",
+            "global_quota_summary": "",
+            "global_quota_summary_short": "",
             "session_input_tokens": 0,
             "session_output_tokens": 0,
             "session_cache_read_tokens": 0,
@@ -1987,6 +2395,9 @@ class HermesCLI:
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        snapshot["quota_summary"] = _get_local_quota_summary(agent)
+        snapshot["global_quota_summary"] = _format_global_quota_summary()
+        snapshot["global_quota_summary_short"] = _format_global_quota_summary(max_segments=2)
         return snapshot
 
     @staticmethod
@@ -2109,12 +2520,26 @@ class HermesCLI:
             percent = snapshot["context_percent"]
             percent_label = f"{percent}%" if percent is not None else "--"
             duration_label = snapshot["duration"]
+            quota_label = snapshot.get("quota_summary", "")
+            global_quota_label = snapshot.get("global_quota_summary", "")
+            global_quota_short = snapshot.get("global_quota_summary_short", "")
 
             if width < 52:
-                text = f"⚕ {snapshot['model_short']} · {duration_label}"
+                compact_quota = _compact_quota_summary(quota_label)
+                parts = [f"⚕ {snapshot['model_short']}"]
+                if compact_quota:
+                    parts.append(compact_quota)
+                parts.append(duration_label)
+                text = " · ".join(parts)
                 return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                parts = [f"⚕ {snapshot['model_short']}"]
+                if global_quota_short:
+                    parts.append(global_quota_short)
+                elif quota_label:
+                    parts.append(quota_label)
+                else:
+                    parts.append(percent_label)
                 parts.append(duration_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
 
@@ -2125,8 +2550,12 @@ class HermesCLI:
             else:
                 context_label = "ctx --"
 
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
-            parts.append(duration_label)
+            parts = [f"⚕ {snapshot['model_short']}"]
+            if global_quota_label:
+                parts.append(global_quota_label)
+            elif quota_label:
+                parts.append(quota_label)
+            parts.extend([context_label, percent_label, duration_label])
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -2143,15 +2572,26 @@ class HermesCLI:
             # line and produce duplicated status bar rows over long sessions.
             width = self._get_tui_terminal_width()
             duration_label = snapshot["duration"]
+            quota_label = snapshot.get("quota_summary", "")
+            global_quota_label = snapshot.get("global_quota_summary", "")
+            global_quota_short = snapshot.get("global_quota_summary_short", "")
 
             if width < 52:
+                compact_quota = _compact_quota_summary(quota_label)
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
+                ]
+                if compact_quota:
+                    frags.extend([
+                        ("class:status-bar-dim", " · "),
+                        (self._status_bar_quota_style(compact_quota), compact_quota),
+                    ])
+                frags.extend([
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                     ("class:status-bar", " "),
-                ]
+                ])
             else:
                 percent = snapshot["context_percent"]
                 percent_label = f"{percent}%" if percent is not None else "--"
@@ -2160,11 +2600,26 @@ class HermesCLI:
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
                         ("class:status-bar-dim", " · "),
-                        (self._status_bar_context_style(percent), percent_label),
-                        ("class:status-bar-dim", " · "),
+                    ]
+                    if global_quota_short:
+                        frags.extend([
+                            (self._status_bar_quota_style(global_quota_short), global_quota_short),
+                            ("class:status-bar-dim", " · "),
+                        ])
+                    elif quota_label:
+                        frags.extend([
+                            (self._status_bar_quota_style(quota_label), quota_label),
+                            ("class:status-bar-dim", " · "),
+                        ])
+                    else:
+                        frags.extend([
+                            (self._status_bar_context_style(percent), percent_label),
+                            ("class:status-bar-dim", " · "),
+                        ])
+                    frags.extend([
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
                 else:
                     if snapshot["context_length"]:
                         ctx_total = _format_context_length(snapshot["context_length"])
@@ -2177,6 +2632,18 @@ class HermesCLI:
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
+                    ]
+                    if global_quota_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " │ "),
+                            (self._status_bar_quota_style(global_quota_label), global_quota_label),
+                        ])
+                    elif quota_label:
+                        frags.extend([
+                            ("class:status-bar-dim", " │ "),
+                            (self._status_bar_quota_style(quota_label), quota_label),
+                        ])
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
@@ -2186,7 +2653,7 @@ class HermesCLI:
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
 
             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
             if total_width > width:
@@ -2837,6 +3304,11 @@ class HermesCLI:
         """Resolve model/runtime overrides for a single user turn."""
         from agent.smart_model_routing import resolve_turn_route
         from hermes_cli.models import resolve_fast_mode_overrides
+        try:
+            from hermes_cli.config import load_config
+            self._smart_model_routing = load_config().get("smart_model_routing", {}) or {}
+        except Exception:
+            pass
 
         route = resolve_turn_route(
             user_message,
@@ -4968,6 +5440,14 @@ class HermesCLI:
         except Exception:
             return False
 
+    def _rewrite_natural_language_model_switch(self, text: str) -> str | None:
+        """Map explicit natural-language model switches onto the /model command."""
+        return _rewrite_natural_language_model_switch(text)
+
+    def _rewrite_natural_language_task_route(self, text: str) -> str | None:
+        """Map explicit natural-language delegation requests onto routing commands."""
+        return _rewrite_natural_language_task_route(text)
+
     def _show_model_and_providers(self):
         """Show current model + provider and list all authenticated providers.
 
@@ -5572,6 +6052,11 @@ class HermesCLI:
                             # Session exists in DB — set title directly
                             try:
                                 if self._session_db.set_session_title(self.session_id, new_title):
+                                    try:
+                                        from agent.title_generator import _sync_terminal_title
+                                        _sync_terminal_title(new_title)
+                                    except Exception:
+                                        pass
                                     _cprint(f"  Session title set: {new_title}")
                                 else:
                                     _cprint("  Session not found in database.")
@@ -5757,11 +6242,18 @@ class HermesCLI:
                 if qcmd.get("type") == "exec":
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
+                    timeout = qcmd.get("timeout", 30)
+                    try:
+                        timeout = float(timeout)
+                    except (TypeError, ValueError):
+                        timeout = 30
                     if exec_cmd:
+                        user_args = cmd_original[len(base_cmd):].strip()
+                        shell_cmd = f"{exec_cmd} {user_args}".strip()
                         try:
                             result = subprocess.run(
-                                exec_cmd, shell=True, capture_output=True,
-                                text=True, timeout=30
+                                shell_cmd, shell=True, capture_output=True,
+                                text=True, timeout=timeout
                             )
                             output = result.stdout.strip() or result.stderr.strip()
                             if output:
@@ -5769,7 +6261,8 @@ class HermesCLI:
                             else:
                                 self.console.print("[dim]Command returned no output[/]")
                         except subprocess.TimeoutExpired:
-                            self.console.print("[bold red]Quick command timed out (30s)[/]")
+                            timeout_label = int(timeout) if float(timeout).is_integer() else timeout
+                            self.console.print(f"[bold red]Quick command timed out ({timeout_label}s)[/]")
                         except Exception as e:
                             self.console.print(f"[bold red]Quick command error: {e}[/]")
                     else:
@@ -5984,7 +6477,7 @@ class HermesCLI:
 
                     _chat_console = ChatConsole()
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _rich_text_from_ansi(response, default_style=_resp_text),
                         title=f"[{_resp_color} bold]{label} (background #{task_num})[/]",
                         title_align="left",
                         border_style=_resp_color,
@@ -8209,7 +8702,7 @@ class HermesCLI:
                 else:
                     _chat_console = ChatConsole()
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _rich_text_from_ansi(response, default_style=_resp_text),
                         title=f"[{_resp_color} bold]{label}[/]",
                         title_align="left",
                         border_style=_resp_color,
@@ -8728,6 +9221,12 @@ class HermesCLI:
             text = event.app.current_buffer.text.strip()
             has_images = bool(self._attached_images)
             if text or has_images:
+                if text and not has_images and not _looks_like_slash_command(text):
+                    rewritten = self._rewrite_natural_language_model_switch(text)
+                    if not rewritten:
+                        rewritten = self._rewrite_natural_language_task_route(text)
+                    if rewritten:
+                        text = rewritten
                 # Handle /model directly on the UI thread so interactive pickers
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
@@ -9961,6 +10460,13 @@ class HermesCLI:
                     submit_images = []
                     if isinstance(user_input, tuple):
                         user_input, submit_images = user_input
+
+                    if isinstance(user_input, str) and not submit_images and not _looks_like_slash_command(user_input):
+                        rewritten = self._rewrite_natural_language_model_switch(user_input)
+                        if not rewritten:
+                            rewritten = self._rewrite_natural_language_task_route(user_input)
+                        if rewritten:
+                            user_input = rewritten
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.

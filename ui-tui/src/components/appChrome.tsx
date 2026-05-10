@@ -7,7 +7,7 @@ import { fmtDuration } from '../domain/messages.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
 import { fmtK } from '../lib/text.js'
 import type { Theme } from '../theme.js'
-import type { Msg, Usage } from '../types.js'
+import type { Msg, QuotaInfo, Usage } from '../types.js'
 
 const FACE_TICK_MS = 2500
 const HEART_COLORS = ['#ff5fa2', '#ff4d6d']
@@ -48,6 +48,19 @@ function ctxBarColor(pct: number | undefined, t: Theme) {
   return t.color.statusGood
 }
 
+function quotaColor(quota: QuotaInfo | null | undefined, t: Theme) {
+  if (!quota) {
+    return t.color.dim
+  }
+  if (quota.severity === 'bad') {
+    return t.color.statusBad
+  }
+  if (quota.severity === 'warn') {
+    return t.color.statusWarn
+  }
+  return t.color.statusGood
+}
+
 function ctxBar(pct: number | undefined, w = 10) {
   const p = Math.max(0, Math.min(100, pct ?? 0))
   const filled = Math.round((p / 100) * w)
@@ -66,6 +79,65 @@ function SessionDuration({ startedAt }: { startedAt: number }) {
   }, [startedAt])
 
   return fmtDuration(now - startedAt)
+}
+
+interface StatusRuleLineOptions {
+  bgCount: number
+  busy: boolean
+  compactWidth: number
+  model: string
+  quota?: QuotaInfo | null
+  sessionStartedAt?: number | null
+  status: string
+  usage: Usage
+  voiceLabel?: string
+}
+
+export function buildStatusRuleLines({
+  bgCount,
+  busy,
+  compactWidth,
+  model,
+  quota,
+  sessionStartedAt,
+  status,
+  usage,
+  voiceLabel
+}: StatusRuleLineOptions): { primary: string; secondary: string } {
+  const pct = usage.context_percent
+  const ctxLabel = usage.context_max
+    ? `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
+    : usage.total > 0
+      ? `${fmtK(usage.total)} tok`
+      : ''
+  const quotaLabel = quota?.summary ?? ''
+  const durationLabel = sessionStartedAt ? fmtDuration(Date.now() - sessionStartedAt) : ''
+  const barLabel = usage.context_max ? `${pct != null ? `${pct}%` : ''}` : ''
+
+  const primaryParts = [
+    status,
+    model,
+    ctxLabel,
+    barLabel,
+    durationLabel,
+    voiceLabel || '',
+    bgCount > 0 ? `${bgCount} bg` : ''
+  ].filter(Boolean)
+  const primary = primaryParts.join(' │ ')
+
+  if (!quotaLabel) {
+    return { primary, secondary: '' }
+  }
+
+  const combined = [status, model, quotaLabel, ctxLabel, barLabel, durationLabel, voiceLabel || '', bgCount > 0 ? `${bgCount} bg` : '']
+    .filter(Boolean)
+    .join(' │ ')
+
+  if (combined.length <= compactWidth) {
+    return { primary: [status, model, quotaLabel, ctxLabel, barLabel, durationLabel, voiceLabel || '', bgCount > 0 ? `${bgCount} bg` : ''].filter(Boolean).join(' │ '), secondary: '' }
+  }
+
+  return { primary, secondary: quotaLabel }
 }
 
 export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
@@ -97,46 +169,39 @@ export function StatusRule({
   statusColor,
   model,
   usage,
+  quota,
   bgCount,
   sessionStartedAt,
   voiceLabel,
   t
 }: StatusRuleProps) {
-  const pct = usage.context_percent
-  const barColor = ctxBarColor(pct, t)
-
-  const ctxLabel = usage.context_max
-    ? `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
-    : usage.total > 0
-      ? `${fmtK(usage.total)} tok`
-      : ''
-
-  const bar = usage.context_max ? ctxBar(pct) : ''
+  const quotaTone = quotaColor(quota, t)
   const leftWidth = Math.max(12, cols - cwdLabel.length - 3)
+  const lines = buildStatusRuleLines({
+    bgCount,
+    busy,
+    compactWidth: Math.max(24, leftWidth - 6),
+    model,
+    quota,
+    sessionStartedAt,
+    status,
+    usage,
+    voiceLabel
+  })
 
   return (
     <Box>
-      <Box flexShrink={1} width={leftWidth}>
+      <Box flexDirection="column" flexShrink={1} width={leftWidth}>
         <Text color={t.color.bronze} wrap="truncate-end">
           {'─ '}
-          {busy ? <FaceTicker color={statusColor} /> : <Text color={statusColor}>{status}</Text>}
-          <Text color={t.color.dim}> │ {model}</Text>
-          {ctxLabel ? <Text color={t.color.dim}> │ {ctxLabel}</Text> : null}
-          {bar ? (
-            <Text color={t.color.dim}>
-              {' │ '}
-              <Text color={barColor}>[{bar}]</Text> <Text color={barColor}>{pct != null ? `${pct}%` : ''}</Text>
-            </Text>
-          ) : null}
-          {sessionStartedAt ? (
-            <Text color={t.color.dim}>
-              {' │ '}
-              <SessionDuration startedAt={sessionStartedAt} />
-            </Text>
-          ) : null}
-          {voiceLabel ? <Text color={t.color.dim}> │ {voiceLabel}</Text> : null}
-          {bgCount > 0 ? <Text color={t.color.dim}> │ {bgCount} bg</Text> : null}
+          {busy ? <FaceTicker color={statusColor} /> : <Text color={statusColor}>{lines.primary}</Text>}
         </Text>
+        {lines.secondary ? (
+          <Text color={quotaTone} wrap="truncate-end">
+            {'  '}
+            {lines.secondary}
+          </Text>
+        ) : null}
       </Box>
 
       <Text color={t.color.bronze}> ─ </Text>
@@ -284,6 +349,7 @@ interface StatusRuleProps {
   cols: number
   cwdLabel: string
   model: string
+  quota?: QuotaInfo | null
   sessionStartedAt?: number | null
   status: string
   statusColor: string

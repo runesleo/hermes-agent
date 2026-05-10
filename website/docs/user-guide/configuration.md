@@ -1072,6 +1072,7 @@ quick_commands:
   status:
     type: exec
     command: systemctl status hermes-agent
+    timeout: 120
   disk:
     type: exec
     command: df -h /
@@ -1085,7 +1086,7 @@ quick_commands:
 
 Usage: type `/status`, `/disk`, `/update`, or `/gpu` in the CLI or any messaging platform. The command runs locally on the host and returns the output directly — no LLM call, no tokens consumed.
 
-- **30-second timeout** — long-running commands are killed with an error message
+- **Optional `timeout` field** — defaults to 30 seconds; set a longer timeout for workflows that intentionally run longer
 - **Priority** — quick commands are checked before skill commands, so you can override skill names
 - **Autocomplete** — quick commands are resolved at dispatch time and are not shown in the built-in slash-command autocomplete tables
 - **Type** — only `exec` is supported (runs a shell command); other types show an error

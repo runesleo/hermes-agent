@@ -26,8 +26,8 @@ Usage:
 from typing import List, Dict, Any, Set, Optional
 
 
-# Shared tool list for CLI and all messaging platform toolsets.
-# Edit this once to update all platforms simultaneously.
+# Full workbench list. Keep available as opt-in, but do not make every CLI
+# session pay the prompt/schema cost for heavy tools by default.
 _HERMES_CORE_TOOLS = [
     # Web
     "web_search", "web_extract",
@@ -60,6 +60,19 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+]
+
+# Lean default for Leo's Opus CLI sessions: enough for research, files, shell,
+# skills, memory, scheduling, and messaging; heavy browser/vision/media/home
+# tools remain opt-in via /tools or explicit toolsets.
+_HERMES_LEAN_TOOLS = [
+    "web_search", "web_extract",
+    "terminal", "process",
+    "read_file", "write_file", "patch", "search_files",
+    "skills_list", "skill_view", "skill_manage",
+    "todo", "memory", "session_search", "clarify",
+    "execute_code",
+    "cronjob", "send_message",
 ]
 
 
@@ -290,15 +303,29 @@ TOOLSETS = {
         "includes": []
     },
     
-    "hermes-cli": {
-        "description": "Full interactive CLI toolset - all default tools plus cronjob management",
+    "hermes-cli-full": {
+        "description": "Full interactive CLI workbench - browser, vision, media, delegation, smart-home, and all core tools",
         "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-cli": {
+        "description": "Lean interactive CLI default - core research/file/shell/skill/memory tools; heavy tools opt-in to reduce Opus prompt cost",
+        "tools": _HERMES_LEAN_TOOLS,
         "includes": []
     },
     
     "hermes-telegram": {
-        "description": "Telegram bot toolset - full access for personal use (terminal has safety checks)",
-        "tools": _HERMES_CORE_TOOLS,
+        "description": "Telegram bot toolset - lean async/mobile tools; heavy browser/vision/media/delegation tools are opt-in to reduce prompt cost",
+        "tools": [
+            "web_search", "web_extract",
+            "terminal", "process",
+            "read_file", "write_file", "patch", "search_files",
+            "skills_list", "skill_view", "skill_manage",
+            "todo", "memory", "session_search", "clarify",
+            "execute_code",
+            "cronjob", "send_message",
+        ],
         "includes": []
     },
     

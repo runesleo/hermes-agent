@@ -51,9 +51,18 @@ export type Role = 'assistant' | 'system' | 'tool' | 'user'
 export type DetailsMode = 'hidden' | 'collapsed' | 'expanded'
 export type ThinkingMode = 'collapsed' | 'truncated' | 'full'
 
+export interface QuotaInfo {
+  estimated?: boolean
+  provider: string
+  severity?: 'bad' | 'good' | 'warn'
+  source?: string
+  summary: string
+}
+
 export interface SessionInfo {
   cwd?: string
   model: string
+  quota?: QuotaInfo | null
   release_date?: string
   skills: Record<string, string[]>
   tools: Record<string, string[]>

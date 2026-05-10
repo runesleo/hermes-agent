@@ -704,6 +704,31 @@ class TestConvertMessages:
         assert len(tool_results) == 1
         assert tool_results[0]["tool_use_id"] == "tc_valid"
 
+    def test_strips_duplicate_tool_result_after_text_only_assistant(self):
+        """Stale tool_result referencing an older turn must not survive a text-only assistant."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_a", "function": {"name": "x", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "tc_a", "content": "ok"},
+            {"role": "assistant", "content": "done"},
+            {"role": "tool", "tool_call_id": "tc_a", "content": "stale duplicate"},
+        ]
+        _, result = convert_messages_to_anthropic(messages)
+        tool_msgs = [
+            b
+            for m in result
+            if m["role"] == "user" and isinstance(m["content"], list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_use_id"] == "tc_a"
+
     def test_system_with_cache_control(self):
         messages = [
             {

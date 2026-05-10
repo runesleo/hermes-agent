@@ -47,6 +47,14 @@ class TestCLIQuickCommands:
         args = cli.console.print.call_args[0][0]
         assert "no output" in args.lower()
 
+    def test_exec_command_passes_args(self):
+        cli = self._make_cli({"route": {"type": "exec", "command": "python3 -c \"import sys; print(sys.argv[1:])\""}})
+        result = cli.process_command('/route hello "two words"')
+        assert result is True
+        cli.console.print.assert_called_once()
+        printed = self._printed_plain(cli.console.print.call_args[0][0])
+        assert printed == "['hello', 'two words']"
+
     def test_alias_command_routes_to_target(self):
         """Alias quick commands rewrite to the target command."""
         cli = self._make_cli({"shortcut": {"type": "alias", "target": "/help"}})
@@ -108,6 +116,13 @@ class TestCLIQuickCommands:
         args = cli.console.print.call_args[0][0]
         assert "timed out" in args.lower()
 
+    def test_exec_command_honors_custom_timeout(self):
+        cli = self._make_cli({"slow": {"type": "exec", "command": "echo ok", "timeout": 120}})
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="ok\n", stderr="")
+            cli.process_command("/slow")
+        assert mock_run.call_args.kwargs["timeout"] == 120
+
 
 # ── Gateway tests ──────────────────────────────────────────────────────────
 
@@ -141,6 +156,19 @@ class TestGatewayQuickCommands:
         assert result == "ok"
 
     @pytest.mark.asyncio
+    async def test_exec_command_passes_args(self):
+        from gateway.run import GatewayRunner
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"route": {"type": "exec", "command": "python3 -c \"import sys; print(sys.argv[1:])\""}}}
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("route", 'hello "two words"')
+        result = await runner._handle_message(event)
+        assert result == "['hello', 'two words']"
+
+    @pytest.mark.asyncio
     async def test_unsupported_type_returns_error(self):
         from gateway.run import GatewayRunner
         runner = GatewayRunner.__new__(GatewayRunner)
@@ -165,10 +193,37 @@ class TestGatewayQuickCommands:
         runner._is_user_authorized = MagicMock(return_value=True)
 
         event = self._make_event("slow")
-        with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError):
+        async def _raise_timeout(awaitable, timeout):
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError
+
+        with patch("asyncio.wait_for", side_effect=_raise_timeout):
             result = await runner._handle_message(event)
         assert result is not None
         assert "timed out" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_gateway_exec_command_honors_custom_timeout(self):
+        from gateway.run import GatewayRunner
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"limits": {"type": "exec", "command": "echo ok", "timeout": 120}}}
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("limits")
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"ok\n", b""))
+
+        async def _wait_for(awaitable, timeout):
+            return await awaitable
+
+        with patch("asyncio.create_subprocess_shell", AsyncMock(return_value=proc)):
+            with patch("asyncio.wait_for", side_effect=_wait_for) as mock_wait_for:
+                result = await runner._handle_message(event)
+        assert result == "ok"
+        assert mock_wait_for.call_args.kwargs["timeout"] == 120
 
     @pytest.mark.asyncio
     async def test_gateway_config_object_supports_quick_commands(self):

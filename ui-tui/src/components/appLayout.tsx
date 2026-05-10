@@ -189,6 +189,7 @@ const ComposerPane = memo(function ComposerPane({
             cols={composer.cols}
             cwdLabel={status.cwdLabel}
             model={ui.info?.model?.split('/').pop() ?? ''}
+            quota={ui.info?.quota}
             sessionStartedAt={status.sessionStartedAt}
             status={ui.status}
             statusColor={status.statusColor}

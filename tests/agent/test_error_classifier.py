@@ -278,6 +278,27 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.server_error
 
+    def test_500_tool_use_id_mismatch_is_non_retryable_format_error(self):
+        """Relays may return HTTP 500 for corrupted tool round-trips — don't backoff-retry."""
+        msg = (
+            "unexpected tool_use_id found in tool_result blocks: "
+            "toolu_01JnUwdQdUNcmrYF2S4M4vaK"
+        )
+        e = MockAPIError(msg, status_code=500)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_500_invalid_request_tool_blocks_non_retryable(self):
+        e = MockAPIError(
+            "invalid_request_error: messages: tool_use_id does not match",
+            status_code=500,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+
     def test_503_overloaded(self):
         e = MockAPIError("Service Unavailable", status_code=503)
         result = classify_api_error(e)

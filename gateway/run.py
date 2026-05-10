@@ -984,6 +984,10 @@ class GatewayRunner:
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
         from hermes_cli.models import resolve_fast_mode_overrides
+        try:
+            self._smart_model_routing = self._load_smart_model_routing()
+        except Exception:
+            pass
 
         primary = {
             "model": model,
@@ -3171,6 +3175,10 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] = event.text
             return None
 
+        # Rewrite explicit natural-language model switches into the existing
+        # /model command flow before command parsing.
+        self._apply_natural_language_model_switch(event)
+
         # Check for commands
         command = event.get_command()
         
@@ -3341,18 +3349,26 @@ class GatewayRunner:
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
+                    timeout = qcmd.get("timeout", 30)
+                    try:
+                        timeout = float(timeout)
+                    except (TypeError, ValueError):
+                        timeout = 30
                     if exec_cmd:
+                        user_args = event.get_command_args().strip()
+                        shell_cmd = f"{exec_cmd} {user_args}".strip()
                         try:
                             proc = await asyncio.create_subprocess_shell(
-                                exec_cmd,
+                                shell_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
                             )
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
                             output = (stdout or stderr).decode().strip()
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
-                            return "Quick command timed out (30s)."
+                            timeout_label = int(timeout) if float(timeout).is_integer() else timeout
+                            return f"Quick command timed out ({timeout_label}s)."
                         except Exception as e:
                             return f"Quick command error: {e}"
                     else:
@@ -5331,6 +5347,21 @@ class GatewayRunner:
             lines.append("_(session only -- add `--global` to persist)_")
 
         return "\n".join(lines)
+
+    def _apply_natural_language_model_switch(self, event: MessageEvent) -> bool:
+        """Rewrite explicit natural-language model switches into ``/model``."""
+        text = (getattr(event, "text", "") or "").strip()
+        if not text or text.startswith("/"):
+            return False
+        try:
+            from hermes_cli.model_switch_intent import maybe_build_model_switch_command
+            rewritten = maybe_build_model_switch_command(text)
+        except Exception:
+            rewritten = None
+        if not rewritten:
+            return False
+        event.text = rewritten
+        return True
 
     async def _handle_provider_command(self, event: MessageEvent) -> str:
         """Handle /provider command - show available providers."""

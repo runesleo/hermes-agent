@@ -147,6 +147,32 @@ class TestSkinManagement:
         init_skin_from_config({"display": {"skin": "ares"}})
         assert get_active_skin_name() == "ares"
 
+    def test_init_skin_from_auto_config_uses_dark_skin_when_system_dark(self):
+        from hermes_cli.skin_engine import init_skin_from_config, get_active_skin_name
+
+        with patch("hermes_cli.skin_engine._system_prefers_dark_mode", return_value=True):
+            init_skin_from_config({
+                "display": {
+                    "skin": "auto",
+                    "light_skin": "daylight",
+                    "dark_skin": "slate",
+                }
+            })
+
+        assert get_active_skin_name() == "slate"
+
+    def test_resolve_configured_skin_name_uses_light_skin_when_system_light(self):
+        from hermes_cli.skin_engine import resolve_configured_skin_name
+
+        with patch("hermes_cli.skin_engine._system_prefers_dark_mode", return_value=False):
+            resolved = resolve_configured_skin_name({
+                "skin": "auto",
+                "light_skin": "daylight",
+                "dark_skin": "slate",
+            })
+
+        assert resolved == "daylight"
+
     def test_init_skin_from_empty_config(self):
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin_name
         init_skin_from_config({})

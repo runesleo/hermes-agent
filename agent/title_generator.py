@@ -5,7 +5,10 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import os
+import subprocess
 import threading
+from pathlib import Path
 from typing import Optional
 
 from agent.auxiliary_client import call_llm
@@ -17,6 +20,26 @@ _TITLE_PROMPT = (
     "following exchange. The title should capture the main topic or intent. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
+
+_TITLE_SYNC_SCRIPT = Path.home() / ".codex" / "scripts" / "terminal-task-title.sh"
+
+
+def _sync_terminal_title(title: Optional[str]) -> None:
+    if not title or not _TITLE_SYNC_SCRIPT.exists():
+        return
+    env = os.environ.copy()
+    if not env.get("ITERM_SESSION_ID") and not env.get("TERM_SESSION_ID"):
+        return
+    try:
+        subprocess.run(
+            [str(_TITLE_SYNC_SCRIPT), "set", title],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+    except Exception:
+        logger.debug("Failed to sync terminal title", exc_info=True)
 
 
 def generate_title(user_message: str, assistant_response: str, timeout: float = 30.0) -> Optional[str]:
@@ -87,6 +110,7 @@ def auto_title_session(
 
     try:
         session_db.set_session_title(session_id, title)
+        _sync_terminal_title(title)
         logger.debug("Auto-generated session title: %s", title)
     except Exception as e:
         logger.debug("Failed to set auto-generated title: %s", e)

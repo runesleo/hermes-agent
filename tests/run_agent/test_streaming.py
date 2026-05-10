@@ -226,6 +226,48 @@ class TestStreamingAccumulator:
         assert response.choices[0].message.content == "Let me check"
         assert len(response.choices[0].message.tool_calls) == 1
 
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_non_iterable_stream_response_is_returned_directly(self, mock_close, mock_create):
+        """Adapters like Copilot ACP may ignore stream=True and return one response object."""
+        from run_agent import AIAgent
+
+        direct_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    message=SimpleNamespace(
+                        role="assistant",
+                        content="ok",
+                        tool_calls=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            model="claude-sonnet-4.6",
+        )
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = direct_response
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="acp://copilot",
+            model="claude-sonnet-4.6",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response is direct_response
+        assert response.choices[0].message.content == "ok"
+
 
 # ── Test: Streaming Callbacks ────────────────────────────────────────────
 
@@ -1086,4 +1128,3 @@ class TestPartialToolCallWarning:
         assert "Stream stalled" not in content, (
             f"Unexpected warning on text-only partial stream: {content!r}"
         )
-

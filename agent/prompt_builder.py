@@ -26,6 +26,34 @@ from agent.skill_utils import (
 )
 from utils import atomic_json_write
 
+
+def _skills_prompt_config() -> dict:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        skills_cfg = cfg.get("skills") or {}
+        return skills_cfg if isinstance(skills_cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _skill_category_excluded(category: str, excluded: "list[str] | tuple[str, ...] | set[str]") -> bool:
+    cat = str(category or "").strip()
+    for raw in excluded or []:
+        prefix = str(raw or "").strip()
+        if not prefix:
+            continue
+        if cat == prefix or cat.startswith(prefix.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _truncate_skill_desc(desc: str, max_chars: int) -> str:
+    text = str(desc or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -627,6 +655,16 @@ def build_skills_system_prompt(
             return cached
 
     disabled = get_disabled_skill_names()
+    skills_prompt_cfg = _skills_prompt_config()
+    excluded_categories = skills_prompt_cfg.get("prompt_exclude_categories") or ["_archived"]
+    if isinstance(excluded_categories, str):
+        excluded_categories = [excluded_categories]
+    try:
+        desc_max_chars = int(skills_prompt_cfg.get("prompt_description_max_chars", 180))
+    except Exception:
+        desc_max_chars = 180
+    include_skill_descriptions = bool(skills_prompt_cfg.get("prompt_include_descriptions", True))
+    include_category_descriptions = bool(skills_prompt_cfg.get("prompt_include_category_descriptions", True))
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
     snapshot = _load_skills_snapshot(skills_dir)
@@ -641,6 +679,8 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry.get("skill_name") or ""
             category = entry.get("category") or "general"
+            if _skill_category_excluded(category, excluded_categories):
+                continue
             frontmatter_name = entry.get("frontmatter_name") or skill_name
             platforms = entry.get("platforms") or []
             if not skill_matches_platform({"platforms": platforms}):
@@ -670,6 +710,8 @@ def build_skills_system_prompt(
             if not is_compatible:
                 continue
             skill_name = entry["skill_name"]
+            if _skill_category_excluded(entry["category"], excluded_categories):
+                continue
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
                 continue
             if not _skill_should_show(
@@ -721,6 +763,8 @@ def build_skills_system_prompt(
                 if not is_compatible:
                     continue
                 entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
+                if _skill_category_excluded(entry["category"], excluded_categories):
+                    continue
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
                 if frontmatter_name in seen_skill_names:
@@ -759,7 +803,7 @@ def build_skills_system_prompt(
     else:
         index_lines = []
         for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
+            cat_desc = category_descriptions.get(category, "") if include_category_descriptions else ""
             if cat_desc:
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
@@ -770,8 +814,8 @@ def build_skills_system_prompt(
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                if include_skill_descriptions and desc:
+                    index_lines.append(f"    - {name}: {_truncate_skill_desc(desc, desc_max_chars)}")
                 else:
                     index_lines.append(f"    - {name}")
 

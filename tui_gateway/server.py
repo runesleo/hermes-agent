@@ -35,6 +35,7 @@ _cfg_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _SLASH_WORKER_TIMEOUT_S = max(5.0, float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S", "45") or 45))
+_quota_cache: dict[str, tuple[float, dict | None]] = {}
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -342,6 +343,11 @@ def _resolve_model() -> str:
     return "anthropic/claude-sonnet-4"
 
 
+def _resolve_provider() -> str | None:
+    env = str(os.environ.get("HERMES_PROVIDER", "") or "").strip()
+    return env or None
+
+
 def _write_config_key(key_path: str, value):
     cfg = _load_cfg()
     current = cfg
@@ -546,6 +552,221 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _fmt_minutes_compact(total_minutes: int | float | None) -> str:
+    if total_minutes is None:
+        return ""
+    try:
+        total = max(0, int(float(total_minutes)))
+    except (TypeError, ValueError):
+        return ""
+    hours, mins = divmod(total, 60)
+    if hours > 0:
+        return f"~{hours}h{mins}m"
+    return f"~{mins}m"
+
+
+def _fmt_compact_number(value: int | float | None) -> str:
+    if value is None:
+        return "0"
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _quota_severity_from_remaining_pct(remaining_pct: float) -> str:
+    if remaining_pct <= 10:
+        return "bad"
+    if remaining_pct <= 25:
+        return "warn"
+    return "good"
+
+
+def _read_json_file(path: Path) -> dict | list | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _find_active_claude_block() -> dict | None:
+    cache_path = Path.home() / ".claude" / "ccusage-cache.json"
+    data = _read_json_file(cache_path)
+    if not isinstance(data, dict):
+        return None
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        return None
+    active = [b for b in blocks if isinstance(b, dict) and b.get("isActive")]
+    block = active[-1] if active else blocks[-1]
+    return block if isinstance(block, dict) else None
+
+
+def _get_claude_quota_info() -> dict | None:
+    block = _find_active_claude_block()
+    if not block:
+        return None
+    projection = block.get("projection") if isinstance(block.get("projection"), dict) else {}
+    remaining = projection.get("remainingMinutes")
+    total_tokens = block.get("totalTokens")
+    cost = block.get("costUSD")
+    parts: list[str] = []
+    if total_tokens is not None:
+        parts.append(f"{_fmt_compact_number(total_tokens)} tok")
+    remaining_label = _fmt_minutes_compact(remaining)
+    if remaining_label:
+        parts.append(f"{remaining_label} left")
+    if cost is not None:
+        try:
+            parts.append(f"${float(cost):.2f}")
+        except (TypeError, ValueError):
+            pass
+    if not parts:
+        return None
+    severity = "good"
+    try:
+        rem_int = int(float(remaining)) if remaining is not None else None
+    except (TypeError, ValueError):
+        rem_int = None
+    if rem_int is not None:
+        if rem_int <= 30:
+            severity = "bad"
+        elif rem_int <= 120:
+            severity = "warn"
+    return {
+        "estimated": False,
+        "provider": "claude",
+        "severity": severity,
+        "source": "ccusage-cache",
+        "summary": " · ".join(parts),
+    }
+
+
+def _find_latest_codex_rate_limits() -> dict | None:
+    sessions_root = Path.home() / ".codex" / "sessions"
+    if not sessions_root.exists():
+        return None
+    try:
+        jsonls = sorted(sessions_root.rglob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    except Exception:
+        return None
+    for path in reversed(jsonls[-50:]):
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    if "rate_limits" not in line:
+                        continue
+                    try:
+                        payload = json.loads(line).get("payload", {})
+                    except Exception:
+                        continue
+                    rate_limits = payload.get("rate_limits")
+                    if isinstance(rate_limits, dict):
+                        return rate_limits
+        except Exception:
+            continue
+    return None
+
+
+def _get_codex_quota_info() -> dict | None:
+    rate_limits = _find_latest_codex_rate_limits()
+    if not isinstance(rate_limits, dict):
+        return None
+    primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else {}
+    secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else {}
+    try:
+        p_remaining = max(0.0, 100.0 - float(primary.get("used_percent") or 0.0))
+    except (TypeError, ValueError):
+        p_remaining = 0.0
+    try:
+        s_remaining = max(0.0, 100.0 - float(secondary.get("used_percent") or 0.0))
+    except (TypeError, ValueError):
+        s_remaining = 0.0
+    plan_type = rate_limits.get("plan_type") or "?"
+    return {
+        "estimated": False,
+        "provider": "codex",
+        "severity": _quota_severity_from_remaining_pct(p_remaining),
+        "source": "codex-session-jsonl",
+        "summary": f"{plan_type} · 5h {p_remaining:.0f}% · 7d {s_remaining:.0f}%",
+    }
+
+
+def _get_copilot_quota_info() -> dict | None:
+    log_path = Path.home() / ".openclaw" / "logs" / "gateway.log"
+    if not log_path.exists():
+        return None
+    month_prefix = datetime.now().strftime("%Y-%m")
+    counts = {"sonnet": 0, "opus": 0, "gpt": 0, "other": 0}
+    patterns = {
+        "sonnet": "agent model: github-copilot/claude-sonnet-4.6",
+        "opus": ("agent model: github-copilot/claude-opus-4.5", "agent model: github-copilot/claude-opus-4.6"),
+        "gpt": ("agent model: github-copilot/gpt-5", "agent model: github-copilot/gpt-4.1"),
+        "other": ("agent model: github-copilot/gemini", "agent model: github-copilot/grok", "agent model: github-copilot/minimax"),
+    }
+    try:
+        with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if not line.startswith(month_prefix):
+                    continue
+                for key, needles in patterns.items():
+                    if isinstance(needles, str):
+                        if needles in line:
+                            counts[key] += 1
+                    elif any(needle in line for needle in needles):
+                        counts[key] += 1
+    except Exception:
+        return None
+    premium_used = counts["sonnet"] + counts["gpt"] + counts["other"] + counts["opus"] * 10
+    cap = 300
+    return {
+        "estimated": True,
+        "provider": "copilot",
+        "severity": "bad" if premium_used >= 270 else "warn" if premium_used >= 225 else "good",
+        "source": "gateway-log-estimate",
+        "summary": f"est {premium_used}/{cap} premium",
+    }
+
+
+def _quota_cache_key(agent) -> str:
+    provider = (getattr(agent, "provider", "") or "").lower()
+    model = (getattr(agent, "model", "") or "").lower()
+    base_url = (getattr(agent, "base_url", "") or "").lower()
+    api_mode = (getattr(agent, "api_mode", "") or "").lower()
+    if provider == "copilot" or "github-copilot" in model or "githubcopilot" in base_url:
+        return "copilot"
+    if provider == "openai-codex" or "codex" in model or "backend-api/codex" in base_url or api_mode == "codex_responses":
+        return "codex"
+    if "claude" in model or provider == "anthropic" or "anthropic.com" in base_url:
+        return "claude"
+    return ""
+
+
+def _get_quota_info(agent) -> dict | None:
+    key = _quota_cache_key(agent)
+    if not key:
+        return None
+    now = time.time()
+    cached = _quota_cache.get(key)
+    if cached and now - cached[0] < 30:
+        return cached[1]
+    if key == "claude":
+        value = _get_claude_quota_info()
+    elif key == "codex":
+        value = _get_codex_quota_info()
+    elif key == "copilot":
+        value = _get_copilot_quota_info()
+    else:
+        value = None
+    _quota_cache[key] = (now, value)
+    return value
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''."""
     try:
@@ -569,6 +790,7 @@ def _session_info(agent) -> dict:
         "update_behind": None,
         "update_command": "",
         "usage": _get_usage(agent),
+        "quota": _get_quota_info(agent),
     }
     try:
         from hermes_cli import __version__, __release_date__
@@ -912,6 +1134,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         system_prompt = _resolve_personality_prompt(cfg)
     return AIAgent(
         model=_resolve_model(),
+        provider=_resolve_provider(),
         quiet_mode=True,
         verbose_logging=_load_tool_progress_mode() == "verbose",
         reasoning_config=_load_reasoning_config(),
@@ -2090,7 +2313,18 @@ def _(rid, params: dict) -> dict:
     if name in qcmds:
         qc = qcmds[name]
         if qc.get("type") == "exec":
-            r = subprocess.run(qc.get("command", ""), shell=True, capture_output=True, text=True, timeout=30)
+            timeout = qc.get("timeout", 30)
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                timeout = 30
+            r = subprocess.run(
+                qc.get("command", ""),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
             output = ((r.stdout or "") + ("\n" if r.stdout and r.stderr else "") + (r.stderr or "")).strip()[:4000]
             if r.returncode != 0:
                 return _err(rid, 4018, output or f"quick command failed with exit code {r.returncode}")

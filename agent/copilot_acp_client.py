@@ -280,6 +280,16 @@ class CopilotACPClient:
         self._active_process: subprocess.Popen[str] | None = None
         self._active_process_lock = threading.Lock()
 
+    def _build_launch_command(self, model: str | None = None) -> list[str]:
+        args = list(self._acp_args)
+        has_model_flag = any(
+            arg == "--model" or str(arg).startswith("--model=")
+            for arg in args
+        )
+        if model and not has_model_flag:
+            args = ["--model", str(model), *args]
+        return [self._acp_command, *args]
+
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
         with self._active_process_lock:
@@ -332,6 +342,7 @@ class CopilotACPClient:
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
+            model_name=model,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -357,10 +368,16 @@ class CopilotACPClient:
             model=model or "copilot-acp",
         )
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model_name: str | None = None,
+    ) -> tuple[str, str]:
         try:
             proc = subprocess.Popen(
-                [self._acp_command] + self._acp_args,
+                self._build_launch_command(model_name),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

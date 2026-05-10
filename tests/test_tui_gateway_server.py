@@ -100,6 +100,86 @@ def _session(agent=None, **extra):
     }
 
 
+def test_session_info_includes_claude_quota_from_ccusage_cache(tmp_path, monkeypatch):
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "ccusage-cache.json").write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {
+                        "isActive": True,
+                        "totalTokens": 12345678,
+                        "costUSD": 12.34,
+                        "projection": {"remainingMinutes": 146},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server.Path, "home", lambda: tmp_path)
+    server._quota_cache.clear()
+
+    info = server._session_info(types.SimpleNamespace(model="claude-sonnet-4.6", provider="anthropic"))
+
+    assert info["quota"]["provider"] == "claude"
+    assert info["quota"]["summary"] == "12.3M tok · ~2h26m left · $12.34"
+    assert info["quota"]["estimated"] is False
+
+
+def test_session_info_includes_codex_quota_from_session_jsonl(tmp_path, monkeypatch):
+    session_dir = tmp_path / ".codex" / "sessions" / "2026" / "04" / "21"
+    session_dir.mkdir(parents=True)
+    (session_dir / "test.jsonl").write_text(
+        json.dumps(
+            {
+                "payload": {
+                    "rate_limits": {
+                        "plan_type": "pro",
+                        "primary": {"used_percent": 10, "window_minutes": 300, "resets_at": 1},
+                        "secondary": {"used_percent": 2, "window_minutes": 10080, "resets_at": 1},
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server.Path, "home", lambda: tmp_path)
+    server._quota_cache.clear()
+
+    info = server._session_info(types.SimpleNamespace(model="gpt-5.2-codex", provider="openai-codex"))
+
+    assert info["quota"]["provider"] == "codex"
+    assert info["quota"]["summary"] == "pro · 5h 90% · 7d 98%"
+    assert info["quota"]["estimated"] is False
+
+
+def test_session_info_includes_copilot_quota_estimate_from_gateway_log(tmp_path, monkeypatch):
+    log_dir = tmp_path / ".openclaw" / "logs"
+    log_dir.mkdir(parents=True)
+    month = time.strftime("%Y-%m")
+    (log_dir / "gateway.log").write_text(
+        "\n".join(
+            [
+                f"{month}-01 agent model: github-copilot/claude-sonnet-4.6",
+                f"{month}-02 agent model: github-copilot/claude-opus-4.6",
+                f"{month}-03 agent model: github-copilot/gpt-4.1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server.Path, "home", lambda: tmp_path)
+    server._quota_cache.clear()
+
+    info = server._session_info(types.SimpleNamespace(model="github-copilot/gpt-4.1", provider="copilot"))
+
+    assert info["quota"]["provider"] == "copilot"
+    assert info["quota"]["summary"] == "est 12/300 premium"
+    assert info["quota"]["estimated"] is True
+
+
 def test_config_set_yolo_toggles_session_scope():
     from tools.approval import clear_session, is_session_yolo_enabled
 

@@ -980,7 +980,12 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     return [node, str(root / "dist" / "entry.js")], root
 
 
-def _launch_tui(resume_session_id: Optional[str] = None, tui_dev: bool = False):
+def _launch_tui(
+    resume_session_id: Optional[str] = None,
+    tui_dev: bool = False,
+    initial_model: Optional[str] = None,
+    initial_provider: Optional[str] = None,
+):
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
 
@@ -990,6 +995,10 @@ def _launch_tui(resume_session_id: Optional[str] = None, tui_dev: bool = False):
     )
     env.setdefault("HERMES_PYTHON", sys.executable)
     env.setdefault("HERMES_CWD", os.getcwd())
+    if initial_model:
+        env["HERMES_MODEL"] = initial_model
+    if initial_provider:
+        env["HERMES_PROVIDER"] = initial_provider
     if resume_session_id:
         env["HERMES_TUI_RESUME"] = resume_session_id
 
@@ -1103,6 +1112,8 @@ def cmd_chat(args):
         _launch_tui(
             getattr(args, "resume", None),
             tui_dev=getattr(args, "tui_dev", False),
+            initial_model=getattr(args, "model", None),
+            initial_provider=getattr(args, "provider", None),
         )
 
     # Import and run the CLI
