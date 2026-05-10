@@ -5605,6 +5605,38 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _apply_natural_language_model_switch(self, event: MessageEvent) -> bool:
+        """Rewrite explicit natural-language model switches into ``/model``."""
+        text = (getattr(event, "text", "") or "").strip()
+        if not text or _message_text_looks_like_slash_command(text):
+            return False
+        try:
+            from hermes_cli.model_switch_intent import maybe_build_model_switch_command
+
+            rewritten = maybe_build_model_switch_command(text)
+        except Exception:
+            rewritten = None
+        if not rewritten:
+            return False
+        event.text = rewritten
+        return True
+
+    def _apply_natural_language_task_route(self, event: MessageEvent) -> bool:
+        """Rewrite explicit Claude/Codex routing phrases into slash commands."""
+        text = (getattr(event, "text", "") or "").strip()
+        if not text or _message_text_looks_like_slash_command(text):
+            return False
+        try:
+            from hermes_cli.task_route_intent import maybe_build_task_route_command
+
+            rewritten = maybe_build_task_route_command(text)
+        except Exception:
+            rewritten = None
+        if not rewritten:
+            return False
+        event.text = rewritten
+        return True
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -6195,29 +6227,10 @@ class GatewayRunner:
             return None
 
         # Natural-language → slash rewriting before command parsing (CLI parity).
-        _nl_text = (event.text or "").strip()
-        if _nl_text and not _message_text_looks_like_slash_command(_nl_text):
-            _rewritten_nl = None
-            try:
-                from hermes_cli.model_switch_intent import (
-                    maybe_build_model_switch_command as _maybe_model_switch,
-                )
-
-                _rewritten_nl = _maybe_model_switch(_nl_text)
-            except Exception:
-                _rewritten_nl = None
-            if not _rewritten_nl:
-                try:
-                    from hermes_cli.task_route_intent import (
-                        maybe_build_task_route_command as _maybe_task_route,
-                    )
-
-                    _rewritten_nl = _maybe_task_route(_nl_text)
-                except Exception:
-                    _rewritten_nl = None
-            if _rewritten_nl:
-                event = dataclasses.replace(event, text=_rewritten_nl)
-                source = event.source
+        if self._apply_natural_language_model_switch(event):
+            source = event.source
+        elif self._apply_natural_language_task_route(event):
+            source = event.source
 
         # Check for commands
         command = event.get_command()
