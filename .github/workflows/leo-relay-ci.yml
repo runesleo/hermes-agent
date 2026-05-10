@@ -34,14 +34,15 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
+      # Uses repo pyproject addopts (-m "not integration", xdist). Ubuntu has no
+      # macOS Keychain, so anthropic_adapter credential tests stay isolated.
       - name: Relay-focused pytest
         run: |
           source .venv/bin/activate
           python -m pytest \
             tests/agent/test_error_classifier.py \
             tests/agent/test_anthropic_adapter.py \
-            -q --tb=short \
-            --override-ini="addopts=-m 'not integration'"
+            -q --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
