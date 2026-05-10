@@ -2136,6 +2136,26 @@ def _looks_like_slash_command(text: str) -> bool:
     return "/" not in first_word[1:]
 
 
+def _rewrite_natural_language_model_switch(text: str) -> str | None:
+    """Return a synthesized ``/model`` command for explicit switch requests."""
+    try:
+        from hermes_cli.model_switch_intent import maybe_build_model_switch_command
+
+        return maybe_build_model_switch_command(text)
+    except Exception:
+        return None
+
+
+def _rewrite_natural_language_task_route(text: str) -> str | None:
+    """Return a synthesized routing command for explicit Claude/Codex delegation."""
+    try:
+        from hermes_cli.task_route_intent import maybe_build_task_route_command
+
+        return maybe_build_task_route_command(text)
+    except Exception:
+        return None
+
+
 # ============================================================================
 # Skill Slash Commands — dynamic commands generated from installed skills
 # ============================================================================
@@ -6395,6 +6415,12 @@ class HermesCLI:
             _cprint("    Saved to config.yaml (--global)")
         else:
             _cprint("    (session only — add --global to persist)")
+
+    def _rewrite_natural_language_model_switch(self, text: str) -> str | None:
+        return _rewrite_natural_language_model_switch(text)
+
+    def _rewrite_natural_language_task_route(self, text: str) -> str | None:
+        return _rewrite_natural_language_task_route(text)
 
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
@@ -10948,6 +10974,12 @@ class HermesCLI:
             text = event.app.current_buffer.text.strip()
             has_images = bool(self._attached_images)
             if text or has_images:
+                if text and not has_images and not _looks_like_slash_command(text):
+                    rewritten = self._rewrite_natural_language_model_switch(text)
+                    if not rewritten:
+                        rewritten = self._rewrite_natural_language_task_route(text)
+                    if rewritten:
+                        text = rewritten
                 # Handle /model directly on the UI thread so interactive pickers
                 # can safely use prompt_toolkit terminal handoff helpers.
                 if self._should_handle_model_command_inline(text, has_images=has_images):
@@ -12489,6 +12521,17 @@ class HermesCLI:
                         user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
                         if _had_mouse_reports:
                             self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
+
+                    if (
+                        isinstance(user_input, str)
+                        and not submit_images
+                        and not _looks_like_slash_command(user_input)
+                    ):
+                        rewritten = self._rewrite_natural_language_model_switch(user_input)
+                        if not rewritten:
+                            rewritten = self._rewrite_natural_language_task_route(user_input)
+                        if rewritten:
+                            user_input = rewritten
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.
@@ -13029,6 +13072,16 @@ def main(
     # Handle single query mode
     if query or image:
         query, single_query_images = _collect_query_images(query, image)
+        if (
+            query
+            and not single_query_images
+            and not _looks_like_slash_command(query)
+        ):
+            _rq = _rewrite_natural_language_model_switch(query)
+            if not _rq:
+                _rq = _rewrite_natural_language_task_route(query)
+            if _rq:
+                query = _rq
         if quiet:
             # Quiet mode: suppress banner, spinner, tool previews.
             # Only print the final response and parseable session info.

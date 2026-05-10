@@ -65,6 +65,14 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 
+def _message_text_looks_like_slash_command(text: str) -> bool:
+    """True when *text* looks like a slash command (not a Unix-style path)."""
+    if not text or not text.startswith("/"):
+        return False
+    first_word = text.split()[0]
+    return "/" not in first_word[1:]
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -6185,6 +6193,31 @@ class GatewayRunner:
             else:
                 self._pending_messages[_quick_key] = event.text
             return None
+
+        # Natural-language → slash rewriting before command parsing (CLI parity).
+        _nl_text = (event.text or "").strip()
+        if _nl_text and not _message_text_looks_like_slash_command(_nl_text):
+            _rewritten_nl = None
+            try:
+                from hermes_cli.model_switch_intent import (
+                    maybe_build_model_switch_command as _maybe_model_switch,
+                )
+
+                _rewritten_nl = _maybe_model_switch(_nl_text)
+            except Exception:
+                _rewritten_nl = None
+            if not _rewritten_nl:
+                try:
+                    from hermes_cli.task_route_intent import (
+                        maybe_build_task_route_command as _maybe_task_route,
+                    )
+
+                    _rewritten_nl = _maybe_task_route(_nl_text)
+                except Exception:
+                    _rewritten_nl = None
+            if _rewritten_nl:
+                event = dataclasses.replace(event, text=_rewritten_nl)
+                source = event.source
 
         # Check for commands
         command = event.get_command()
